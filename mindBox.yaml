@@ -1,0 +1,163 @@
+# Namespace — чтобы всё жило в отдельной «песочнице»
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mindbox
+---
+# Deployment — собственно приложение
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mindbox-app
+  namespace: mindbox
+  labels:
+    app: mindbox
+spec:
+  # Минимум 3 реплики — по одной в каждую зону, чтобы не терять сервис при падении зоны.
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mindbox
+  template:
+    metadata:
+      labels:
+        app: mindbox
+    spec:
+      terminationGracePeriodSeconds: 20
+      containers:
+      - name: web
+        # Демо-образ, который отдаёт HTML (для браузера). При реальном деплое заменить на свой.
+        image: nginxdemos/hello:latest
+        ports:
+        - containerPort: 80
+        resources:
+          # requests под стабильную фазу: ~0.1 CPU, 128Mi RAM
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          # limits позволяют «подпрыгнуть» на первых тяжёлых запросах
+          limits:
+            cpu: "1"
+            memory: "256Mi"
+        # Учитываем 5–10 секунд на старт
+        startupProbe:
+          httpGet:
+            path: /
+            port: 80
+          failureThreshold: 10
+          periodSeconds: 2
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      # Раскладываем поды по зонам и нодам, избегаем «скученности» на одной машине
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: mindbox
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: mindbox
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app: mindbox
+---
+# Service — точка входа для трафика в кластер
+apiVersion: v1
+kind: Service
+metadata:
+  name: mindbox-service
+  namespace: mindbox
+spec:
+  selector:
+    app: mindbox
+  ports:
+  - port: 80
+    targetPort: 80
+  type: ClusterIP
+---
+# Ingress — чтобы открывалось в браузере (http://mindbox.local)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mindbox-ingress
+  namespace: mindbox
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: mindbox.local   # для локальной проверки пропиши в /etc/hosts -> <IP ingress> mindbox.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: mindbox-service
+            port:
+              number: 80
+---
+# HorizontalPodAutoscaler — автомасштабирование по CPU
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mindbox-app-hpa
+  namespace: mindbox
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mindbox-app
+  minReplicas: 3       # ночью держим 3 (по зонам)
+  maxReplicas: 8       # днём HPA вырастет, пиков хватает 4, но оставим запас
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+---
+# PodDisruptionBudget — чтобы во время обновлений/эвакуаций оставалось минимум 2 пода
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mindbox-app-pdb
+  namespace: mindbox
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: mindbox
